@@ -1,0 +1,98 @@
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+    }
+
+    environment {
+        PROJECT_NAME = 'QA API Automation'
+        TEST_DIR = 'part1_api_automation'
+        REPORT_DIR = 'part1_api_automation/reports'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                script {
+                    def pushedBranch = env.gitlabSourceBranch ?: env.BRANCH_NAME ?: 'develop'
+                    if (!(pushedBranch in ['main', 'develop'])) {
+                        error("Unsupported branch: ${pushedBranch}")
+                    }
+                    env.REPORT_BRANCH = pushedBranch
+                    env.REPORT_TRIGGER = env.gitlabActionType ?: 'PUSH'
+
+                    checkout([
+                        $class: 'GitSCM',
+                        branches: [[name: "*/${pushedBranch}"]],
+                        userRemoteConfigs: [[
+                            credentialsId: 'scm-read-credential',
+                            url: 'https://git.example.com/group/project.git'
+                        ]]
+                    ])
+                }
+            }
+        }
+
+        stage('Setup') {
+            steps {
+                sh '''
+                    python3 -m venv .venv
+                    .venv/bin/pip install --disable-pip-version-check -r ${TEST_DIR}/requirements.txt
+                '''
+            }
+        }
+
+        stage('API Test') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'qa-student-account',
+                        usernameVariable: 'STUDENT_LOGIN_ID',
+                        passwordVariable: 'STUDENT_PASSWORD'
+                    ),
+                    usernamePassword(
+                        credentialsId: 'qa-educator-account',
+                        usernameVariable: 'EDUCATOR_LOGIN_ID',
+                        passwordVariable: 'EDUCATOR_PASSWORD'
+                    )
+                ]) {
+                    sh '''
+                        .venv/bin/python -m pytest ${TEST_DIR}/tests \
+                          --junitxml=${REPORT_DIR}/junit.xml \
+                          --alluredir=${REPORT_DIR}/allure-results
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            junit allowEmptyResults: true, testResults: 'part1_api_automation/reports/junit.xml'
+            allure includeProperties: false, results: [[path: 'part1_api_automation/reports/allure-results']]
+
+            withCredentials([
+                string(credentialsId: 'discord-webhook', variable: 'DISCORD_WEBHOOK_URL')
+            ]) {
+                catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                    sh '.venv/bin/python tools/send_discord_report.py'
+                }
+            }
+        }
+
+        cleanup {
+            cleanWs(deleteDirs: true, notFailBuild: true)
+        }
+    }
+}
+
+/*
+Job configuration (GitLab Plugin):
+- Trigger: Build when a change is pushed to GitLab
+- Push Events: enabled
+- Branch filter regex: ^(main|develop)$
+- Secret token: store in Jenkins/GitLab settings only; never commit it
+*/
